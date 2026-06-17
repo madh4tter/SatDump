@@ -1,6 +1,7 @@
 #include "tracking_widget.h"
 #include "common/imgui_utils.h"
 #include "common/tracking/rotator/rotcl_handler.h"
+#include "common/tracking/imu/bno055_handler.h"
 #include "core/config.h"
 #include "core/style.h"
 #include "imgui/imgui.h"
@@ -42,6 +43,26 @@ namespace satdump
             {
             }
         }
+
+        imu_options = imu::getImuHandlerOptions();
+        for (auto &st : imu_options)
+            imu_options_str += st.name + '\0';
+
+        imu_handler = imu_options[selected_imu_handler].construct();
+
+        if (imu_handler)
+        {
+            try
+            {
+                nlohmann::json cfg = db->get_user_json("recorder_tracking");
+                imu_handler->set_settings(cfg["imu_config"][imu_handler->get_id()]);
+            }
+            catch (std::exception &)
+            {
+            }
+        }
+
+        object_tracker.setImuHandler(imu_handler);
 
         // Init Obj Tracker
         object_tracker.setQTH(qth_lon, qth_lat, qth_alt);
@@ -85,7 +106,10 @@ namespace satdump
         }
     }
 
-    TrackingWidget::~TrackingWidget() { saveConfig(); }
+    TrackingWidget::~TrackingWidget()
+    {
+        saveConfig();
+    }
 
     void TrackingWidget::render()
     {
@@ -126,6 +150,32 @@ namespace satdump
                 style::endDisabled();
 
             rotator_handler->render();
+        }
+
+        if (ImGui::CollapsingHeader("IMU / Pointing Configuration"))
+        {
+            if (imu_handler->is_connected())
+                style::beginDisabled();
+            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+            if (ImGui::Combo("Type##imutype", &selected_imu_handler, imu_options_str.c_str()))
+            {
+                imu_handler = imu_options[selected_imu_handler].construct();
+
+                try
+                {
+                    nlohmann::json cfg = db->get_user_json("recorder_tracking");
+                    imu_handler->set_settings(cfg["imu_config"][imu_handler->get_id()]);
+                }
+                catch (std::exception &)
+                {
+                }
+
+                object_tracker.setImuHandler(imu_handler);
+            }
+            if (imu_handler->is_connected())
+                style::endDisabled();
+
+            imu_handler->render();
         }
 
         ImGui::Spacing();

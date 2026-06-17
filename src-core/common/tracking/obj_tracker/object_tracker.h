@@ -6,6 +6,7 @@
 #include "libs/predict/predict.h"
 #include <thread>
 #include "common/tracking/rotator/rotator_handler.h"
+#include "common/tracking/imu/imu_handler.h"
 #include "common/geodetic/geodetic_coordinates.h"
 #include "image/image.h"
 
@@ -109,6 +110,10 @@ namespace satdump
         std::thread rotatorth_thread;
         void rotatorth_run();
 
+        bool imuth_should_run = true;
+        std::thread imuth_thread;
+        void imuth_run();
+
     private: // Current satellite
         SatAzEl sat_current_pos;
 
@@ -149,6 +154,16 @@ namespace satdump
 
         double tracking_time_offset = 0;
 
+    private: // IMU / handheld device pointing
+        std::mutex imu_mtx;
+        std::shared_ptr<imu::ImuHandler> imu_handler;
+        bool imu_valid = false;
+        SatAzEl imu_current_pos;
+        int imu_cal_sys = 0, imu_cal_mag = 0; // 0-3, BNO055-style calibration status
+        double imu_last_update_time = 0;
+        double imu_timeout_s = 2.0; // Mark stale/invalid if no update for this long
+        double imu_update_period = 0.05; // 20Hz default poll rate
+
     public: // Handlers
         std::function<void(double, double)> rotator_target_pos_updated_callback; //Todo: this calls from rotatorth_thread
 
@@ -162,6 +177,10 @@ namespace satdump
         void setRotatorEngaged(bool v);
         void setRotatorTracking(bool v);
         void setRotatorReqPos(float az, float el);
+
+        void setImuHandler(std::shared_ptr<imu::ImuHandler> handler);
+        bool getImuValid();
+        bool getImuPos(SatAzEl &pos, int &cal_sys, int &cal_mag); // returns false if stale/invalid/no handler
 
         void renderPolarPlot();
         void renderSelectionMenu();

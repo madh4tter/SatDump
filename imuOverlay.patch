@@ -1,0 +1,716 @@
+diff --git a/src-core/common/tracking/imu/bno055_handler.cpp b/src-core/common/tracking/imu/bno055_handler.cpp
+new file mode 100644
+index 0000000..0e435a7
+--- /dev/null
++++ b/src-core/common/tracking/imu/bno055_handler.cpp
+@@ -0,0 +1,213 @@
++#include "bno055_handler.h"
++#include "imgui/imgui.h"
++#include "core/style.h"
++#include "logger.h"
++
++#ifdef __linux__
++#include <fcntl.h>
++#include <unistd.h>
++#include <linux/i2c-dev.h>
++#include <sys/ioctl.h>
++#endif
++
++namespace imu
++{
++    // BNO055 register map (subset used here)
++    static const uint8_t REG_OPR_MODE = 0x3D;
++    static const uint8_t REG_CALIB_STAT = 0x35;
++    static const uint8_t REG_EULER_H_LSB = 0x1A; // heading, roll, pitch follow as 6 bytes
++    static const uint8_t MODE_NDOF = 0x0C;        // fused 9-DOF absolute orientation mode
++
++    Bno055Handler::Bno055Handler()
++    {
++    }
++
++    Bno055Handler::~Bno055Handler()
++    {
++        l_disconnect();
++    }
++
++    bool Bno055Handler::writeReg(uint8_t reg, uint8_t val)
++    {
++#ifdef __linux__
++        uint8_t buf[2] = {reg, val};
++        return ::write(fd, buf, 2) == 2;
++#else
++        (void)reg;
++        (void)val;
++        return false;
++#endif
++    }
++
++    bool Bno055Handler::readBytes(uint8_t reg, uint8_t *buf, int len)
++    {
++#ifdef __linux__
++        if (::write(fd, &reg, 1) != 1)
++            return false;
++        return ::read(fd, buf, len) == len;
++#else
++        (void)reg;
++        (void)buf;
++        (void)len;
++        return false;
++#endif
++    }
++
++    void Bno055Handler::l_connect(const char *device, int address)
++    {
++#ifdef __linux__
++        std::lock_guard<std::mutex> lock(dev_mtx);
++        if (fd >= 0)
++        {
++            ::close(fd);
++            fd = -1;
++        }
++
++        fd = ::open(device, O_RDWR);
++        if (fd < 0)
++        {
++            logger->error("Could not open I2C device %s", device);
++            return;
++        }
++
++        if (ioctl(fd, I2C_SLAVE, address) < 0)
++        {
++            logger->error("Could not set I2C slave address 0x%02X", address);
++            ::close(fd);
++            fd = -1;
++            return;
++        }
++
++        // Switch to NDOF fusion mode -- gives calibrated absolute heading/pitch/roll
++        if (!writeReg(REG_OPR_MODE, MODE_NDOF))
++        {
++            logger->error("Could not set BNO055 to NDOF mode");
++            ::close(fd);
++            fd = -1;
++            return;
++        }
++#else
++        (void)device;
++        (void)address;
++        logger->error("BNO055 I2C support is only implemented for Linux");
++#endif
++    }
++
++    void Bno055Handler::l_disconnect()
++    {
++#ifdef __linux__
++        std::lock_guard<std::mutex> lock(dev_mtx);
++        if (fd >= 0)
++            ::close(fd);
++        fd = -1;
++#endif
++    }
++
++    std::string Bno055Handler::get_id()
++    {
++        return "bno055";
++    }
++
++    void Bno055Handler::set_settings(nlohmann::json settings)
++    {
++        std::string vdevice = getValueOrDefault(settings["device"], std::string(input_device));
++        memcpy(input_device, vdevice.data(), std::min(vdevice.size() + 1, sizeof(input_device)));
++        input_address = getValueOrDefault(settings["address"], input_address);
++        input_declination = getValueOrDefault(settings["declination"], input_declination);
++        input_offset_heading = getValueOrDefault(settings["offset_heading"], input_offset_heading);
++        input_offset_pitch = getValueOrDefault(settings["offset_pitch"], input_offset_pitch);
++    }
++
++    nlohmann::json Bno055Handler::get_settings()
++    {
++        nlohmann::json v;
++        v["device"] = std::string(input_device);
++        v["address"] = input_address;
++        v["declination"] = input_declination;
++        v["offset_heading"] = input_offset_heading;
++        v["offset_pitch"] = input_offset_pitch;
++        return v;
++    }
++
++    imu_status_t Bno055Handler::get_pos(float *heading, float *pitch, int *cal_sys, int *cal_mag)
++    {
++        std::lock_guard<std::mutex> lock(dev_mtx);
++        if (fd < 0)
++            return IMU_ERROR_CON;
++
++        uint8_t euler[6];
++        if (!readBytes(REG_EULER_H_LSB, euler, 6))
++            return IMU_ERROR_CMD;
++
++        // Each value is a signed 16-bit little-endian, raw/16.0 = degrees
++        int16_t raw_heading = (int16_t)(euler[0] | (euler[1] << 8));
++        // bytes 2,3 = roll, not used here
++        int16_t raw_pitch = (int16_t)(euler[4] | (euler[5] << 8));
++
++        float h = (raw_heading / 16.0f) + input_declination + input_offset_heading;
++        h = fmodf(h + 360.0f, 360.0f);
++
++        // BNO055 reports pitch as device tilt; sign convention depends on physical mounting.
++        // Adjust input_offset_pitch / flip sign here if your mount orientation differs.
++        float p = (raw_pitch / 16.0f) + input_offset_pitch;
++
++        uint8_t cal = 0;
++        if (!readBytes(REG_CALIB_STAT, &cal, 1))
++            return IMU_ERROR_CMD;
++
++        *heading = h;
++        *pitch = p;
++        *cal_sys = (cal >> 6) & 0x03;
++        *cal_mag = (cal >> 4) & 0x03;
++
++        return IMU_ERROR_OK;
++    }
++
++    void Bno055Handler::render()
++    {
++        bool connected = is_connected();
++
++        if (connected)
++            style::beginDisabled();
++        ImGui::InputText("I2C Device##bno055device", input_device, sizeof(input_device));
++        ImGui::InputInt("I2C Address##bno055address", &input_address);
++        if (connected)
++            style::endDisabled();
++
++        ImGui::InputFloat("Magnetic Declination##bno055decl", &input_declination);
++        if (ImGui::IsItemHovered())
++            ImGui::SetTooltip("Local magnetic declination in degrees, added to raw heading to get true north");
++
++        ImGui::InputFloat("Heading Offset##bno055offh", &input_offset_heading);
++        ImGui::InputFloat("Pitch Offset##bno055offp", &input_offset_pitch);
++        if (ImGui::IsItemHovered())
++            ImGui::SetTooltip("Corrects for physical misalignment between the sensor and the antenna boresight");
++
++        if (connected)
++        {
++            if (ImGui::Button("Disconnect##bno055disconnect"))
++                disconnect();
++        }
++        else
++        {
++            if (ImGui::Button("Connect##bno055connect"))
++                connect();
++        }
++    }
++
++    bool Bno055Handler::is_connected()
++    {
++        std::lock_guard<std::mutex> lock(dev_mtx);
++        return fd >= 0;
++    }
++
++    void Bno055Handler::connect()
++    {
++        l_connect(input_device, input_address);
++    }
++
++    void Bno055Handler::disconnect()
++    {
++        l_disconnect();
++    }
++}
+diff --git a/src-core/common/tracking/imu/bno055_handler.h b/src-core/common/tracking/imu/bno055_handler.h
+new file mode 100644
+index 0000000..ec1d9bc
+--- /dev/null
++++ b/src-core/common/tracking/imu/bno055_handler.h
+@@ -0,0 +1,43 @@
++#pragma once
++
++#include "imu_handler.h"
++#include <mutex>
++
++namespace imu
++{
++    // Reads orientation (heading, pitch) and calibration status from a Bosch BNO055
++    // over Linux I2C (e.g. /dev/i2c-1 on a Raspberry Pi). Sensor fusion is done onboard
++    // the BNO055's own Cortex-M0, so this handler is just a register reader -- no AHRS
++    // filtering happens on the Pi.
++    class Bno055Handler : public ImuHandler
++    {
++    private:
++        int fd = -1;
++        char input_device[100] = "/dev/i2c-1";
++        int input_address = 0x28;
++        float input_declination = 0.0f;  // local magnetic declination, added to raw heading
++        float input_offset_heading = 0.0f; // mounting correction, added after declination
++        float input_offset_pitch = 0.0f;   // mounting correction
++
++        std::mutex dev_mtx;
++
++        bool writeReg(uint8_t reg, uint8_t val);
++        bool readBytes(uint8_t reg, uint8_t *buf, int len);
++
++        void l_connect(const char *device, int address);
++        void l_disconnect();
++
++    public:
++        Bno055Handler();
++        ~Bno055Handler();
++
++        std::string get_id() override;
++        void set_settings(nlohmann::json settings) override;
++        nlohmann::json get_settings() override;
++        imu_status_t get_pos(float *heading, float *pitch, int *cal_sys, int *cal_mag) override;
++        void render() override;
++        bool is_connected() override;
++        void connect() override;
++        void disconnect() override;
++    };
++}
+diff --git a/src-core/common/tracking/imu/imu_handler.cpp b/src-core/common/tracking/imu/imu_handler.cpp
+new file mode 100644
+index 0000000..ffd7510
+--- /dev/null
++++ b/src-core/common/tracking/imu/imu_handler.cpp
+@@ -0,0 +1,19 @@
++#include "imu_handler.h"
++#include "core/plugin.h"
++
++#include "bno055_handler.h"
++
++namespace imu
++{
++    std::vector<ImuHandlerOption> getImuHandlerOptions()
++    {
++        std::vector<ImuHandlerOption> imuOptions;
++
++        imuOptions.push_back({"bno055", []()
++                               { return std::make_shared<Bno055Handler>(); }});
++
++        satdump::eventBus->fire_event<RequestImuHandlerOptionsEvent>({imuOptions});
++
++        return imuOptions;
++    }
++}
+diff --git a/src-core/common/tracking/imu/imu_handler.h b/src-core/common/tracking/imu/imu_handler.h
+new file mode 100644
+index 0000000..466a42d
+--- /dev/null
++++ b/src-core/common/tracking/imu/imu_handler.h
+@@ -0,0 +1,51 @@
++#pragma once
++
++#include <string>
++#include <functional>
++#include <vector>
++#include <memory>
++#include "nlohmann/json.hpp"
++#include "nlohmann/json_utils.h"
++
++namespace imu
++{
++    enum imu_status_t
++    {
++        IMU_ERROR_OK = 0,  // No error
++        IMU_ERROR_CMD = 1, // Read/command error
++        IMU_ERROR_CON = 2, // Connection error
++    };
++
++    // Mirrors rotator::RotatorHandler. heading/pitch are in degrees:
++    //   heading: compass heading the device/antenna boresight is facing, 0-360, true north
++    //            (declination correction is the handler's responsibility, not the caller's)
++    //   pitch:   angle above the horizontal plane, typically 0..90 for sky pointing
++    // cal_sys/cal_mag: 0-3 calibration confidence (BNO055-style). Handlers without a notion of
++    //   calibration (e.g. a simple tilt sensor) should just always report 3/3 once readings are valid.
++    class ImuHandler
++    {
++    public:
++        virtual std::string get_id() = 0;
++        virtual void set_settings(nlohmann::json settings) = 0;
++        virtual nlohmann::json get_settings() = 0;
++        virtual imu_status_t get_pos(float *heading, float *pitch, int *cal_sys, int *cal_mag) = 0;
++        virtual void render() = 0;
++        virtual bool is_connected() = 0;
++        virtual void connect() = 0;
++        virtual void disconnect() = 0;
++        virtual ~ImuHandler() {}
++    };
++
++    struct ImuHandlerOption
++    {
++        std::string name;
++        std::function<std::shared_ptr<ImuHandler>()> construct;
++    };
++
++    struct RequestImuHandlerOptionsEvent
++    {
++        std::vector<ImuHandlerOption> &opts;
++    };
++
++    std::vector<ImuHandlerOption> getImuHandlerOptions();
++}
+diff --git a/src-core/common/tracking/obj_tracker/object_tracker.cpp b/src-core/common/tracking/obj_tracker/object_tracker.cpp
+index 716599c..01c01b0 100644
+--- a/src-core/common/tracking/obj_tracker/object_tracker.cpp
++++ b/src-core/common/tracking/obj_tracker/object_tracker.cpp
+@@ -4,6 +4,7 @@
+ #include "common/utils.h"
+ #include "core/plugin.h"
+ #include "init.h"
++#include "utils/time.h"
+ 
+ namespace satdump
+ {
+@@ -38,6 +39,7 @@ namespace satdump
+         // Start threads
+         backend_thread = std::thread(&ObjectTracker::backend_run, this);
+         rotatorth_thread = std::thread(&ObjectTracker::rotatorth_run, this);
++        imuth_thread = std::thread(&ObjectTracker::imuth_run, this);
+     }
+ 
+     ObjectTracker::~ObjectTracker()
+@@ -50,6 +52,10 @@ namespace satdump
+         if (rotatorth_thread.joinable())
+             rotatorth_thread.join();
+ 
++        imuth_should_run = false;
++        if (imuth_thread.joinable())
++            imuth_thread.join();
++
+         predict_destroy_observer(satellite_observer_station);
+ 
+         if (satellite_object != nullptr)
+@@ -134,4 +140,67 @@ namespace satdump
+         rot_current_req_pos.el = el;
+         rotator_handler_mtx.unlock();
+     }
++
++    void ObjectTracker::setImuHandler(std::shared_ptr<imu::ImuHandler> handler)
++    {
++        imu_mtx.lock();
++        imu_handler = handler;
++        imu_valid = false; // force re-validation against the new handler
++        imu_mtx.unlock();
++    }
++
++    bool ObjectTracker::getImuValid()
++    {
++        imu_mtx.lock();
++        bool v = imu_valid && (getTime() - imu_last_update_time) < imu_timeout_s;
++        imu_mtx.unlock();
++        return v;
++    }
++
++    bool ObjectTracker::getImuPos(SatAzEl &pos, int &cal_sys, int &cal_mag)
++    {
++        imu_mtx.lock();
++        bool v = imu_valid && (getTime() - imu_last_update_time) < imu_timeout_s;
++        if (v)
++        {
++            pos = imu_current_pos;
++            cal_sys = imu_cal_sys;
++            cal_mag = imu_cal_mag;
++        }
++        imu_mtx.unlock();
++        return v;
++    }
++
++    void ObjectTracker::imuth_run()
++    {
++        while (imuth_should_run)
++        {
++            imu_mtx.lock();
++            std::shared_ptr<imu::ImuHandler> handler = imu_handler;
++            imu_mtx.unlock();
++
++            if (handler && handler->is_connected())
++            {
++                float heading = 0, pitch = 0;
++                int cal_sys = 0, cal_mag = 0;
++                if (handler->get_pos(&heading, &pitch, &cal_sys, &cal_mag) == imu::IMU_ERROR_OK)
++                {
++                    imu_mtx.lock();
++                    imu_current_pos.az = heading;
++                    imu_current_pos.el = pitch;
++                    imu_cal_sys = cal_sys;
++                    imu_cal_mag = cal_mag;
++                    imu_last_update_time = getTime();
++                    imu_valid = true;
++                    imu_mtx.unlock();
++                }
++
++                std::this_thread::sleep_for(std::chrono::milliseconds(uint64_t(imu_update_period * 1e3)));
++            }
++            else
++            {
++                std::this_thread::sleep_for(std::chrono::milliseconds(200));
++            }
++        }
++    }
+ } // namespace satdump
+diff --git a/src-core/common/tracking/obj_tracker/object_tracker.h b/src-core/common/tracking/obj_tracker/object_tracker.h
+index 473afb4..0da75ec 100644
+--- a/src-core/common/tracking/obj_tracker/object_tracker.h
++++ b/src-core/common/tracking/obj_tracker/object_tracker.h
+@@ -6,6 +6,7 @@
+ #include "libs/predict/predict.h"
+ #include <thread>
+ #include "common/tracking/rotator/rotator_handler.h"
++#include "common/tracking/imu/imu_handler.h"
+ #include "common/geodetic/geodetic_coordinates.h"
+ #include "image/image.h"
+ 
+@@ -109,6 +110,10 @@ namespace satdump
+         std::thread rotatorth_thread;
+         void rotatorth_run();
+ 
++        bool imuth_should_run = true;
++        std::thread imuth_thread;
++        void imuth_run();
++
+     private: // Current satellite
+         SatAzEl sat_current_pos;
+ 
+@@ -149,6 +154,16 @@ namespace satdump
+ 
+         double tracking_time_offset = 0;
+ 
++    private: // IMU / handheld device pointing
++        std::mutex imu_mtx;
++        std::shared_ptr<imu::ImuHandler> imu_handler;
++        bool imu_valid = false;
++        SatAzEl imu_current_pos;
++        int imu_cal_sys = 0, imu_cal_mag = 0; // 0-3, BNO055-style calibration status
++        double imu_last_update_time = 0;
++        double imu_timeout_s = 2.0; // Mark stale/invalid if no update for this long
++        double imu_update_period = 0.05; // 20Hz default poll rate
++
+     public: // Handlers
+         std::function<void(double, double)> rotator_target_pos_updated_callback; //Todo: this calls from rotatorth_thread
+ 
+@@ -163,6 +178,10 @@ namespace satdump
+         void setRotatorTracking(bool v);
+         void setRotatorReqPos(float az, float el);
+ 
++        void setImuHandler(std::shared_ptr<imu::ImuHandler> handler);
++        bool getImuValid();
++        bool getImuPos(SatAzEl &pos, int &cal_sys, int &cal_mag); // returns false if stale/invalid/no handler
++
+         void renderPolarPlot();
+         void renderSelectionMenu();
+         void renderObjectStatus();
+diff --git a/src-core/common/tracking/obj_tracker/object_tracker_render.cpp b/src-core/common/tracking/obj_tracker/object_tracker_render.cpp
+index 54def97..22f8da0 100644
+--- a/src-core/common/tracking/obj_tracker/object_tracker_render.cpp
++++ b/src-core/common/tracking/obj_tracker/object_tracker_render.cpp
+@@ -123,6 +123,55 @@ namespace satdump
+                 draw_list->AddLine({point_x, point_y + 5 * ui_scale}, {point_x, point_y + 12 * ui_scale}, style::theme.light_cyan, 2.0);
+             }
+         }
++
++        // Draw the handheld device/antenna pointing direction from the IMU, if available.
++        // This sits on the same polar plot as the satellite (red dot) and rotator (cyan ring),
++        // so the user can visually rotate the device until this marker lines up with the satellite.
++        {
++            SatAzEl imu_pos;
++            int cal_sys = 0, cal_mag = 0;
++            if (getImuPos(imu_pos, cal_sys, cal_mag))
++            {
++                float point_x = ImGui::GetCursorScreenPos().x + (d_pplot_size / 2);
++                float point_y = ImGui::GetCursorScreenPos().y + (d_pplot_size / 2);
++
++                point_x += az_el_to_plot_x(d_pplot_size, radius, imu_pos.az, imu_pos.el);
++                point_y -= az_el_to_plot_y(d_pplot_size, radius, imu_pos.az, imu_pos.el);
++
++                float ch = 10 * ui_scale;
++                ImColor imu_col = style::theme.yellow;
++                draw_list->AddLine({point_x - ch, point_y}, {point_x + ch, point_y}, imu_col, 2.0);
++                draw_list->AddLine({point_x, point_y - ch}, {point_x, point_y + ch}, imu_col, 2.0);
++                draw_list->AddCircle({point_x, point_y}, ch * 0.7f, imu_col, 16, 1.5);
++
++                // Draw a connecting line to the satellite position, when tracking one and it's above horizon,
++                // so the "how far off am I" gap is visually obvious, not just numeric.
++                if (tracking_mode != TRACKING_NONE && sat_current_pos.el > 0)
++                {
++                    float sat_x = ImGui::GetCursorScreenPos().x + (d_pplot_size / 2);
++                    float sat_y = ImGui::GetCursorScreenPos().y + (d_pplot_size / 2);
++                    sat_x += az_el_to_plot_x(d_pplot_size, radius, sat_current_pos.az, sat_current_pos.el);
++                    sat_y -= az_el_to_plot_y(d_pplot_size, radius, sat_current_pos.az, sat_current_pos.el);
++
++                    draw_list->AddLine({point_x, point_y}, {sat_x, sat_y}, ImColor(style::theme.orange.Value.x, style::theme.orange.Value.y, style::theme.orange.Value.z, 0.6f), 1.5);
++                }
++
++                // Small calibration indicator, bottom-left corner of the plot.
++                // BNO055-style: 0 = uncalibrated (grey), 1-2 = partial (yellow), 3 = full (green)
++                auto cal_color = [](int level) -> ImColor
++                {
++                    if (level >= 3) return style::theme.green;
++                    if (level >= 1) return style::theme.yellow;
++                    return ImColor(128, 128, 128, 255);
++                };
++
++                float dot_r = 4 * ui_scale;
++                float dot_y = ImGui::GetCursorScreenPos().y + d_pplot_size - 10 * ui_scale;
++                float dot_x = ImGui::GetCursorScreenPos().x + 10 * ui_scale;
++                draw_list->AddCircleFilled({dot_x, dot_y}, dot_r, cal_color(cal_sys));
++                draw_list->AddCircleFilled({dot_x + 14 * ui_scale, dot_y}, dot_r, cal_color(cal_mag));
++            }
++        }
+ #if 1
+         if (next_aos_time != 0 && next_los_time != 0)
+         {
+@@ -331,6 +380,37 @@ namespace satdump
+                 ImGui::Text("%.2f", satellite_observation_pos.range);
+             }
+ 
++            {
++                SatAzEl imu_pos;
++                int cal_sys = 0, cal_mag = 0;
++                if (getImuPos(imu_pos, cal_sys, cal_mag))
++                {
++                    float az_err = sat_current_pos.az - imu_pos.az;
++                    if (az_err > 180) az_err -= 360;
++                    if (az_err < -180) az_err += 360;
++                    float el_err = sat_current_pos.el - imu_pos.el;
++                    float total_err = sqrt(az_err * az_err + el_err * el_err);
++
++                    ImVec4 err_col = style::theme.green.Value;
++                    if (total_err >= 15)
++                        err_col = style::theme.red.Value;
++                    else if (total_err >= 5)
++                        err_col = style::theme.yellow.Value;
++
++                    ImGui::TableNextRow();
++                    ImGui::TableSetColumnIndex(0);
++                    ImGui::Text("Device Heading");
++                    ImGui::TableSetColumnIndex(1);
++                    ImGui::Text("%.1f / %.1f", imu_pos.az, imu_pos.el);
++
++                    ImGui::TableNextRow();
++                    ImGui::TableSetColumnIndex(0);
++                    ImGui::Text("Pointing Error");
++                    ImGui::TableSetColumnIndex(1);
++                    ImGui::TextColored(err_col, "Turn %+.1f / Tilt %+.1f", az_err, el_err);
++                }
++            }
++
+             ImGui::EndTable();
+         }
+     }
+diff --git a/src-interface/recorder/tracking/tracking_widget.cpp b/src-interface/recorder/tracking/tracking_widget.cpp
+index e790e04..af92ea1 100644
+--- a/src-interface/recorder/tracking/tracking_widget.cpp
++++ b/src-interface/recorder/tracking/tracking_widget.cpp
+@@ -1,6 +1,7 @@
+ #include "tracking_widget.h"
+ #include "common/imgui_utils.h"
+ #include "common/tracking/rotator/rotcl_handler.h"
++#include "common/tracking/imu/bno055_handler.h"
+ #include "core/config.h"
+ #include "core/style.h"
+ #include "imgui/imgui.h"
+@@ -43,6 +44,26 @@ namespace satdump
+             }
+         }
+ 
++        imu_options = imu::getImuHandlerOptions();
++        for (auto &st : imu_options)
++            imu_options_str += st.name + '\0';
++
++        imu_handler = imu_options[selected_imu_handler].construct();
++
++        if (imu_handler)
++        {
++            try
++            {
++                nlohmann::json cfg = db->get_user_json("recorder_tracking");
++                imu_handler->set_settings(cfg["imu_config"][imu_handler->get_id()]);
++            }
++            catch (std::exception &)
++            {
++            }
++        }
++
++        object_tracker.setImuHandler(imu_handler);
++
+         // Init Obj Tracker
+         object_tracker.setQTH(qth_lon, qth_lat, qth_alt);
+         object_tracker.setRotator(rotator_handler);
+@@ -85,7 +106,10 @@ namespace satdump
+         }
+     }
+ 
+-    TrackingWidget::~TrackingWidget() { saveConfig(); }
++    TrackingWidget::~TrackingWidget()
++    {
++        saveConfig();
++    }
+ 
+     void TrackingWidget::render()
+     {
+@@ -128,6 +152,32 @@ namespace satdump
+             rotator_handler->render();
+         }
+ 
++        if (ImGui::CollapsingHeader("IMU / Pointing Configuration"))
++        {
++            if (imu_handler->is_connected())
++                style::beginDisabled();
++            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
++            if (ImGui::Combo("Type##imutype", &selected_imu_handler, imu_options_str.c_str()))
++            {
++                imu_handler = imu_options[selected_imu_handler].construct();
++
++                try
++                {
++                    nlohmann::json cfg = db->get_user_json("recorder_tracking");
++                    imu_handler->set_settings(cfg["imu_config"][imu_handler->get_id()]);
++                }
++                catch (std::exception &)
++                {
++                }
++
++                object_tracker.setImuHandler(imu_handler);
++            }
++            if (imu_handler->is_connected())
++                style::endDisabled();
++
++            imu_handler->render();
++        }
++
+         ImGui::Spacing();
+         ImGui::Separator();
+         ImGui::Spacing();
+diff --git a/src-interface/recorder/tracking/tracking_widget.h b/src-interface/recorder/tracking/tracking_widget.h
+index 008d2e1..5a168c6 100644
+--- a/src-interface/recorder/tracking/tracking_widget.h
++++ b/src-interface/recorder/tracking/tracking_widget.h
+@@ -14,6 +14,7 @@
+ #include "common/tracking/obj_tracker/object_tracker.h"
+ #include "common/tracking/sat_finder/sat_finder_ui.h"
+ #include "common/tracking/scheduler/scheduler.h"
++#include "common/tracking/imu/imu_handler.h"
+ #include "import_export.h"
+ 
+ namespace satdump
+@@ -43,6 +44,11 @@ namespace satdump
+         std::string rotator_options_str;
+         int selected_rotator_handler = 0;
+ 
++        std::shared_ptr<imu::ImuHandler> imu_handler;
++        std::vector<imu::ImuHandlerOption> imu_options;
++        std::string imu_options_str;
++        int selected_imu_handler = 0;
++
+         bool config_window_was_asked = false, show_window_config = false;
+         bool satellite_finder_was_asked = false, show_satellite_finder_window = false;
+ 
+@@ -55,6 +61,8 @@ namespace satdump
+             cfg["autotrack_cfg"] = auto_scheduler.getAutoTrackCfg();
+             if (rotator_handler)
+                 cfg["rotator_config"][rotator_handler->get_id()] = rotator_handler->get_settings();
++            if (imu_handler)
++                cfg["imu_config"][imu_handler->get_id()] = imu_handler->get_settings();
+ 
+             db->set_user_json("recorder_tracking", cfg);
+         }
+     };

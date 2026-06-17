@@ -123,6 +123,55 @@ namespace satdump
                 draw_list->AddLine({point_x, point_y + 5 * ui_scale}, {point_x, point_y + 12 * ui_scale}, style::theme.light_cyan, 2.0);
             }
         }
+
+        // Draw the handheld device/antenna pointing direction from the IMU, if available.
+        // This sits on the same polar plot as the satellite (red dot) and rotator (cyan ring),
+        // so the user can visually rotate the device until this marker lines up with the satellite.
+        {
+            SatAzEl imu_pos;
+            int cal_sys = 0, cal_mag = 0;
+            if (getImuPos(imu_pos, cal_sys, cal_mag))
+            {
+                float point_x = ImGui::GetCursorScreenPos().x + (d_pplot_size / 2);
+                float point_y = ImGui::GetCursorScreenPos().y + (d_pplot_size / 2);
+
+                point_x += az_el_to_plot_x(d_pplot_size, radius, imu_pos.az, imu_pos.el);
+                point_y -= az_el_to_plot_y(d_pplot_size, radius, imu_pos.az, imu_pos.el);
+
+                float ch = 10 * ui_scale;
+                ImColor imu_col = style::theme.yellow;
+                draw_list->AddLine({point_x - ch, point_y}, {point_x + ch, point_y}, imu_col, 2.0);
+                draw_list->AddLine({point_x, point_y - ch}, {point_x, point_y + ch}, imu_col, 2.0);
+                draw_list->AddCircle({point_x, point_y}, ch * 0.7f, imu_col, 16, 1.5);
+
+                // Draw a connecting line to the satellite position, when tracking one and it's above horizon,
+                // so the "how far off am I" gap is visually obvious, not just numeric.
+                if (tracking_mode != TRACKING_NONE && sat_current_pos.el > 0)
+                {
+                    float sat_x = ImGui::GetCursorScreenPos().x + (d_pplot_size / 2);
+                    float sat_y = ImGui::GetCursorScreenPos().y + (d_pplot_size / 2);
+                    sat_x += az_el_to_plot_x(d_pplot_size, radius, sat_current_pos.az, sat_current_pos.el);
+                    sat_y -= az_el_to_plot_y(d_pplot_size, radius, sat_current_pos.az, sat_current_pos.el);
+
+                    draw_list->AddLine({point_x, point_y}, {sat_x, sat_y}, ImColor(style::theme.orange.Value.x, style::theme.orange.Value.y, style::theme.orange.Value.z, 0.6f), 1.5);
+                }
+
+                // Small calibration indicator, bottom-left corner of the plot.
+                // BNO055-style: 0 = uncalibrated (grey), 1-2 = partial (yellow), 3 = full (green)
+                auto cal_color = [](int level) -> ImColor
+                {
+                    if (level >= 3) return style::theme.green;
+                    if (level >= 1) return style::theme.yellow;
+                    return ImColor(128, 128, 128, 255);
+                };
+
+                float dot_r = 4 * ui_scale;
+                float dot_y = ImGui::GetCursorScreenPos().y + d_pplot_size - 10 * ui_scale;
+                float dot_x = ImGui::GetCursorScreenPos().x + 10 * ui_scale;
+                draw_list->AddCircleFilled({dot_x, dot_y}, dot_r, cal_color(cal_sys));
+                draw_list->AddCircleFilled({dot_x + 14 * ui_scale, dot_y}, dot_r, cal_color(cal_mag));
+            }
+        }
 #if 1
         if (next_aos_time != 0 && next_los_time != 0)
         {
@@ -329,6 +378,37 @@ namespace satdump
                 ImGui::Text("Range (km)");
                 ImGui::TableSetColumnIndex(1);
                 ImGui::Text("%.2f", satellite_observation_pos.range);
+            }
+
+            {
+                SatAzEl imu_pos;
+                int cal_sys = 0, cal_mag = 0;
+                if (getImuPos(imu_pos, cal_sys, cal_mag))
+                {
+                    float az_err = sat_current_pos.az - imu_pos.az;
+                    if (az_err > 180) az_err -= 360;
+                    if (az_err < -180) az_err += 360;
+                    float el_err = sat_current_pos.el - imu_pos.el;
+                    float total_err = sqrt(az_err * az_err + el_err * el_err);
+
+                    ImVec4 err_col = style::theme.green.Value;
+                    if (total_err >= 15)
+                        err_col = style::theme.red.Value;
+                    else if (total_err >= 5)
+                        err_col = style::theme.yellow.Value;
+
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::Text("Device Heading");
+                    ImGui::TableSetColumnIndex(1);
+                    ImGui::Text("%.1f / %.1f", imu_pos.az, imu_pos.el);
+
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::Text("Pointing Error");
+                    ImGui::TableSetColumnIndex(1);
+                    ImGui::TextColored(err_col, "Turn %+.1f / Tilt %+.1f", az_err, el_err);
+                }
             }
 
             ImGui::EndTable();

@@ -4,6 +4,7 @@
 #include "common/utils.h"
 #include "core/plugin.h"
 #include "init.h"
+#include "utils/time.h"
 
 namespace satdump
 {
@@ -38,6 +39,7 @@ namespace satdump
         // Start threads
         backend_thread = std::thread(&ObjectTracker::backend_run, this);
         rotatorth_thread = std::thread(&ObjectTracker::rotatorth_run, this);
+        imuth_thread = std::thread(&ObjectTracker::imuth_run, this);
     }
 
     ObjectTracker::~ObjectTracker()
@@ -49,6 +51,10 @@ namespace satdump
         rotatorth_should_run = false;
         if (rotatorth_thread.joinable())
             rotatorth_thread.join();
+
+        imuth_should_run = false;
+        if (imuth_thread.joinable())
+            imuth_thread.join();
 
         predict_destroy_observer(satellite_observer_station);
 
@@ -133,5 +139,68 @@ namespace satdump
         rot_current_req_pos.az = az;
         rot_current_req_pos.el = el;
         rotator_handler_mtx.unlock();
+    }
+
+    void ObjectTracker::setImuHandler(std::shared_ptr<imu::ImuHandler> handler)
+    {
+        imu_mtx.lock();
+        imu_handler = handler;
+        imu_valid = false; // force re-validation against the new handler
+        imu_mtx.unlock();
+    }
+
+    bool ObjectTracker::getImuValid()
+    {
+        imu_mtx.lock();
+        bool v = imu_valid && (getTime() - imu_last_update_time) < imu_timeout_s;
+        imu_mtx.unlock();
+        return v;
+    }
+
+    bool ObjectTracker::getImuPos(SatAzEl &pos, int &cal_sys, int &cal_mag)
+    {
+        imu_mtx.lock();
+        bool v = imu_valid && (getTime() - imu_last_update_time) < imu_timeout_s;
+        if (v)
+        {
+            pos = imu_current_pos;
+            cal_sys = imu_cal_sys;
+            cal_mag = imu_cal_mag;
+        }
+        imu_mtx.unlock();
+        return v;
+    }
+
+    void ObjectTracker::imuth_run()
+    {
+        while (imuth_should_run)
+        {
+            imu_mtx.lock();
+            std::shared_ptr<imu::ImuHandler> handler = imu_handler;
+            imu_mtx.unlock();
+
+            if (handler && handler->is_connected())
+            {
+                float heading = 0, pitch = 0;
+                int cal_sys = 0, cal_mag = 0;
+                if (handler->get_pos(&heading, &pitch, &cal_sys, &cal_mag) == imu::IMU_ERROR_OK)
+                {
+                    imu_mtx.lock();
+                    imu_current_pos.az = heading;
+                    imu_current_pos.el = pitch;
+                    imu_cal_sys = cal_sys;
+                    imu_cal_mag = cal_mag;
+                    imu_last_update_time = getTime();
+                    imu_valid = true;
+                    imu_mtx.unlock();
+                }
+
+                std::this_thread::sleep_for(std::chrono::milliseconds(uint64_t(imu_update_period * 1e3)));
+            }
+            else
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            }
+        }
     }
 } // namespace satdump
