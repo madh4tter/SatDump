@@ -2,6 +2,8 @@
 #include "common/imgui_utils.h"
 #include "common/tracking/rotator/rotcl_handler.h"
 #include "common/tracking/imu/bno055_handler.h"
+#include "common/tracking/gps/gpsd_handler.h"
+#include "common/geodetic/vincentys_calculations.h"
 #include "core/config.h"
 #include "core/style.h"
 #include "imgui/imgui.h"
@@ -64,6 +66,24 @@ namespace satdump
 
         object_tracker.setImuHandler(imu_handler);
 
+        gps_options = gps::getGpsHandlerOptions();
+        for (auto &st : gps_options)
+            gps_options_str += st.name + '\0';
+
+        gps_handler = gps_options[selected_gps_handler].construct();
+
+        if (gps_handler)
+        {
+            try
+            {
+                nlohmann::json cfg = db->get_user_json("recorder_tracking");
+                gps_handler->set_settings(cfg["gps_config"][gps_handler->get_id()]);
+            }
+            catch (std::exception &)
+            {
+            }
+        }
+
         // Init Obj Tracker
         object_tracker.setQTH(qth_lon, qth_lat, qth_alt);
         object_tracker.setRotator(rotator_handler);
@@ -104,11 +124,71 @@ namespace satdump
                 auto_scheduler.setEngaged(true, getTime());
             }
         }
+
+        // Start GPS polling thread. This only ever pushes a new QTH into object_tracker /
+        // sat_finder / auto_scheduler when gps_live_qth_enabled is set AND the fix has moved
+        // meaningfully -- setQTH() recomputes the SGP4 observer and forces a full pass
+        // recalculation, so it's deliberately throttled rather than called on every fix.
+        gpsth_thread = std::thread(&TrackingWidget::gpsth_run, this);
     }
 
     TrackingWidget::~TrackingWidget()
     {
         saveConfig();
+
+        gpsth_should_run = false;
+        if (gpsth_thread.joinable())
+            gpsth_thread.join();
+    }
+
+    void TrackingWidget::gpsth_run()
+    {
+        double last_pushed_lat = qth_lat, last_pushed_lon = qth_lon, last_pushed_alt = qth_alt;
+        double last_push_time = 0;
+
+        while (gpsth_should_run)
+        {
+            gps_handler_mtx.lock();
+            std::shared_ptr<gps::GpsHandler> handler = gps_handler;
+            gps_handler_mtx.unlock();
+
+            if (gps_live_qth_enabled && handler && handler->is_connected())
+            {
+                double lat, lon, alt_m;
+                if (handler->get_fix(&lat, &lon, &alt_m) == gps::GPS_ERROR_OK)
+                {
+                    double now = getTime();
+                    double alt_km = alt_m / 1000.0;
+
+                    geodetic::geodetic_curve_t curve = geodetic::vincentys_inverse(
+                        geodetic::geodetic_coords_t(last_pushed_lat, last_pushed_lon, last_pushed_alt),
+                        geodetic::geodetic_coords_t(lat, lon, alt_km));
+
+                    bool moved_enough = curve.distance > (gps_min_move_meters / 1000.0); // vincentys distance is in km
+                    bool time_elapsed = (now - last_push_time) > gps_min_update_period_s;
+
+                    if (moved_enough && time_elapsed)
+                    {
+                        qth_lat = lat;
+                        qth_lon = lon;
+                        qth_alt = alt_km;
+
+                        object_tracker.setQTH(qth_lon, qth_lat, qth_alt);
+                        sat_finder.setQTH(qth_lon, qth_lat, qth_alt);
+                        auto_scheduler.setQTH(qth_lon, qth_lat, qth_alt);
+
+                        last_pushed_lat = lat;
+                        last_pushed_lon = lon;
+                        last_pushed_alt = alt_km;
+                        last_push_time = now;
+
+                        logger->info("Live GPS QTH update: %f, %f, %.3fkm", lat, lon, alt_km);
+                    }
+                }
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(1000)); // 1Hz poll is plenty given the throttling above
+        }
     }
 
     void TrackingWidget::render()
@@ -176,6 +256,39 @@ namespace satdump
                 style::endDisabled();
 
             imu_handler->render();
+        }
+
+        if (ImGui::CollapsingHeader("GPS / Live QTH Configuration"))
+        {
+            if (gps_handler->is_connected())
+                style::beginDisabled();
+            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+            if (ImGui::Combo("Type##gpstype", &selected_gps_handler, gps_options_str.c_str()))
+            {
+                gps_handler_mtx.lock();
+                gps_handler = gps_options[selected_gps_handler].construct();
+                gps_handler_mtx.unlock();
+
+                try
+                {
+                    nlohmann::json cfg = db->get_user_json("recorder_tracking");
+                    gps_handler->set_settings(cfg["gps_config"][gps_handler->get_id()]);
+                }
+                catch (std::exception &)
+                {
+                }
+            }
+            if (gps_handler->is_connected())
+                style::endDisabled();
+
+            gps_handler->render();
+
+            ImGui::Spacing();
+            ImGui::Checkbox("Use GPS fix as live QTH", &gps_live_qth_enabled);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("While enabled, your observer location updates automatically as the GPS fix moves.\nQTH is only pushed when the fix has moved more than a configured threshold, to avoid\nconstantly recomputing satellite passes.");
+
+            ImGui::Text("QTH: %.5f, %.5f, %.3f km", qth_lat, qth_lon, qth_alt);
         }
 
         ImGui::Spacing();

@@ -1,0 +1,617 @@
+diff --git a/src-core/common/tracking/gps/gps_handler.cpp b/src-core/common/tracking/gps/gps_handler.cpp
+new file mode 100644
+index 0000000..b6a8891
+--- /dev/null
++++ b/src-core/common/tracking/gps/gps_handler.cpp
+@@ -0,0 +1,19 @@
++#include "gps_handler.h"
++#include "core/plugin.h"
++
++#include "gpsd_handler.h"
++
++namespace gps
++{
++    std::vector<GpsHandlerOption> getGpsHandlerOptions()
++    {
++        std::vector<GpsHandlerOption> gpsOptions;
++
++        gpsOptions.push_back({"gpsd", []()
++                               { return std::make_shared<GpsdHandler>(); }});
++
++        satdump::eventBus->fire_event<RequestGpsHandlerOptionsEvent>({gpsOptions});
++
++        return gpsOptions;
++    }
++}
+diff --git a/src-core/common/tracking/gps/gps_handler.h b/src-core/common/tracking/gps/gps_handler.h
+new file mode 100644
+index 0000000..ad03414
+--- /dev/null
++++ b/src-core/common/tracking/gps/gps_handler.h
+@@ -0,0 +1,46 @@
++#pragma once
++
++#include <string>
++#include <functional>
++#include <vector>
++#include <memory>
++#include "nlohmann/json.hpp"
++#include "nlohmann/json_utils.h"
++
++namespace gps
++{
++    enum gps_status_t
++    {
++        GPS_ERROR_OK = 0,  // No error, fix is valid
++        GPS_ERROR_NOFIX = 1, // Connected but no valid fix yet
++        GPS_ERROR_CON = 2,   // Connection error
++    };
++
++    // Mirrors imu::ImuHandler / rotator::RotatorHandler. lat/lon in degrees, alt in meters.
++    class GpsHandler
++    {
++    public:
++        virtual std::string get_id() = 0;
++        virtual void set_settings(nlohmann::json settings) = 0;
++        virtual nlohmann::json get_settings() = 0;
++        virtual gps_status_t get_fix(double *lat, double *lon, double *alt) = 0;
++        virtual void render() = 0;
++        virtual bool is_connected() = 0;
++        virtual void connect() = 0;
++        virtual void disconnect() = 0;
++        virtual ~GpsHandler() {}
++    };
++
++    struct GpsHandlerOption
++    {
++        std::string name;
++        std::function<std::shared_ptr<GpsHandler>()> construct;
++    };
++
++    struct RequestGpsHandlerOptionsEvent
++    {
++        std::vector<GpsHandlerOption> &opts;
++    };
++
++    std::vector<GpsHandlerOption> getGpsHandlerOptions();
++}
+diff --git a/src-core/common/tracking/gps/gpsd_handler.cpp b/src-core/common/tracking/gps/gpsd_handler.cpp
+new file mode 100644
+index 0000000..2aca821
+--- /dev/null
++++ b/src-core/common/tracking/gps/gpsd_handler.cpp
+@@ -0,0 +1,279 @@
++#include "gpsd_handler.h"
++#include "imgui/imgui.h"
++#include "core/style.h"
++#include "logger.h"
++
++#ifdef __linux__
++#include <sys/socket.h>
++#include <netinet/in.h>
++#include <arpa/inet.h>
++#include <unistd.h>
++#include <cstring>
++#include <netdb.h>
++#endif
++
++namespace gps
++{
++    GpsdHandler::GpsdHandler()
++    {
++    }
++
++    GpsdHandler::~GpsdHandler()
++    {
++        l_disconnect();
++    }
++
++    void GpsdHandler::l_connect(const char *host, int port)
++    {
++#ifdef __linux__
++        l_disconnect();
++
++        struct addrinfo hints, *res = nullptr;
++        memset(&hints, 0, sizeof(hints));
++        hints.ai_family = AF_UNSPEC;
++        hints.ai_socktype = SOCK_STREAM;
++
++        char port_str[16];
++        snprintf(port_str, sizeof(port_str), "%d", port);
++
++        if (getaddrinfo(host, port_str, &hints, &res) != 0)
++        {
++            logger->error("Could not resolve gpsd host %s", host);
++            return;
++        }
++
++        int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
++        if (fd < 0)
++        {
++            logger->error("Could not create socket for gpsd connection");
++            freeaddrinfo(res);
++            return;
++        }
++
++        if (::connect(fd, res->ai_addr, res->ai_addrlen) < 0)
++        {
++            logger->error("Could not connect to gpsd at %s:%d", host, port);
++            ::close(fd);
++            freeaddrinfo(res);
++            return;
++        }
++        freeaddrinfo(res);
++
++        // Enable streaming JSON TPV reports
++        const char *watch_cmd = "?WATCH={\"enable\":true,\"json\":true};\n";
++        if (::send(fd, watch_cmd, strlen(watch_cmd), 0) < 0)
++        {
++            logger->error("Could not send WATCH command to gpsd");
++            ::close(fd);
++            return;
++        }
++
++        {
++            std::lock_guard<std::mutex> lock(sock_mtx);
++            sock_fd = fd;
++        }
++
++        {
++            std::lock_guard<std::mutex> lock(fix_mtx);
++            has_fix = false;
++        }
++
++        reader_should_run = true;
++        reader_thread = std::thread(&GpsdHandler::reader_run, this);
++#else
++        (void)host;
++        (void)port;
++        logger->error("gpsd support is only implemented for Linux");
++#endif
++    }
++
++    void GpsdHandler::l_disconnect()
++    {
++        reader_should_run = false;
++
++#ifdef __linux__
++        {
++            std::lock_guard<std::mutex> lock(sock_mtx);
++            if (sock_fd >= 0)
++            {
++                // Unblock any pending recv() in the reader thread
++                ::shutdown(sock_fd, SHUT_RDWR);
++                ::close(sock_fd);
++                sock_fd = -1;
++            }
++        }
++#endif
++
++        if (reader_thread.joinable())
++            reader_thread.join();
++
++        std::lock_guard<std::mutex> lock(fix_mtx);
++        has_fix = false;
++    }
++
++    void GpsdHandler::reader_run()
++    {
++#ifdef __linux__
++        std::string buffer;
++        char chunk[4096];
++
++        while (reader_should_run)
++        {
++            int fd;
++            {
++                std::lock_guard<std::mutex> lock(sock_mtx);
++                fd = sock_fd;
++            }
++            if (fd < 0)
++                break;
++
++            ssize_t n = ::recv(fd, chunk, sizeof(chunk) - 1, 0);
++            if (n <= 0)
++            {
++                // Connection closed or error -- stop, leave reconnect to the user via UI
++                break;
++            }
++            chunk[n] = '\0';
++            buffer += chunk;
++
++            // gpsd sends newline-delimited JSON objects
++            size_t pos;
++            while ((pos = buffer.find('\n')) != std::string::npos)
++            {
++                std::string line = buffer.substr(0, pos);
++                buffer.erase(0, pos + 1);
++
++                if (line.empty())
++                    continue;
++
++                try
++                {
++                    nlohmann::json j = nlohmann::json::parse(line);
++                    if (j.contains("class") && j["class"] == "TPV")
++                    {
++                        // mode: 0=unknown, 1=no fix, 2=2D fix, 3=3D fix
++                        int mode = j.contains("mode") ? j["mode"].get<int>() : 0;
++                        if (mode >= 2 && j.contains("lat") && j.contains("lon"))
++                        {
++                            std::lock_guard<std::mutex> lock(fix_mtx);
++                            last_lat = j["lat"].get<double>();
++                            last_lon = j["lon"].get<double>();
++                            // altMSL (mean sea level) preferred; fall back to "alt" (older gpsd) or 0
++                            if (j.contains("altMSL"))
++                                last_alt = j["altMSL"].get<double>();
++                            else if (j.contains("alt"))
++                                last_alt = j["alt"].get<double>();
++                            else
++                                last_alt = 0;
++                            has_fix = true;
++                        }
++                        else
++                        {
++                            std::lock_guard<std::mutex> lock(fix_mtx);
++                            has_fix = false;
++                        }
++                    }
++                }
++                catch (std::exception &)
++                {
++                    // Malformed/partial line, ignore and continue
++                }
++            }
++        }
++
++        {
++            std::lock_guard<std::mutex> lock(fix_mtx);
++            has_fix = false;
++        }
++#endif
++    }
++
++    std::string GpsdHandler::get_id()
++    {
++        return "gpsd";
++    }
++
++    void GpsdHandler::set_settings(nlohmann::json settings)
++    {
++        std::string vhost = getValueOrDefault(settings["host"], std::string(input_host));
++        memcpy(input_host, vhost.data(), std::min(vhost.size() + 1, sizeof(input_host)));
++        input_port = getValueOrDefault(settings["port"], input_port);
++    }
++
++    nlohmann::json GpsdHandler::get_settings()
++    {
++        nlohmann::json v;
++        v["host"] = std::string(input_host);
++        v["port"] = input_port;
++        return v;
++    }
++
++    gps_status_t GpsdHandler::get_fix(double *lat, double *lon, double *alt)
++    {
++        if (!is_connected())
++            return GPS_ERROR_CON;
++
++        std::lock_guard<std::mutex> lock(fix_mtx);
++        if (!has_fix)
++            return GPS_ERROR_NOFIX;
++
++        *lat = last_lat;
++        *lon = last_lon;
++        *alt = last_alt;
++        return GPS_ERROR_OK;
++    }
++
++    void GpsdHandler::render()
++    {
++        bool connected = is_connected();
++
++        if (connected)
++            style::beginDisabled();
++        ImGui::InputText("gpsd Host##gpsdhost", input_host, sizeof(input_host));
++        ImGui::InputInt("gpsd Port##gpsdport", &input_port);
++        if (connected)
++            style::endDisabled();
++
++        if (connected)
++        {
++            bool fixed;
++            double lat, lon, alt;
++            {
++                std::lock_guard<std::mutex> lock(fix_mtx);
++                fixed = has_fix;
++                lat = last_lat;
++                lon = last_lon;
++                alt = last_alt;
++            }
++
++            if (fixed)
++                ImGui::TextColored(style::theme.green.Value, "Fix: %.5f, %.5f, %.0fm", lat, lon, alt);
++            else
++                ImGui::TextColored(style::theme.yellow.Value, "Connected, waiting for fix...");
++
++            if (ImGui::Button("Disconnect##gpsddisconnect"))
++                disconnect();
++        }
++        else
++        {
++            if (ImGui::Button("Connect##gpsdconnect"))
++                connect();
++        }
++    }
++
++    bool GpsdHandler::is_connected()
++    {
++        std::lock_guard<std::mutex> lock(sock_mtx);
++        return sock_fd >= 0;
++    }
++
++    void GpsdHandler::connect()
++    {
++        l_connect(input_host, input_port);
++    }
++
++    void GpsdHandler::disconnect()
++    {
++        l_disconnect();
++    }
++}
+diff --git a/src-core/common/tracking/gps/gpsd_handler.h b/src-core/common/tracking/gps/gpsd_handler.h
+new file mode 100644
+index 0000000..63a335e
+--- /dev/null
++++ b/src-core/common/tracking/gps/gpsd_handler.h
+@@ -0,0 +1,49 @@
++#pragma once
++
++#include "gps_handler.h"
++#include <mutex>
++#include <atomic>
++#include <thread>
++
++namespace gps
++{
++    // Connects to a running gpsd instance (https://gpsd.io/) over its JSON TCP protocol,
++    // typically localhost:2947. gpsd handles all the NMEA/UBX parsing and multi-constellation
++    // fusion itself -- this handler just consumes its "TPV" (Time-Position-Velocity) reports.
++    //
++    // Requires gpsd to be running and pointed at the actual GPS device, e.g.:
++    //   gpsd /dev/ttyAMA0 -F /var/run/gpsd.sock
++    class GpsdHandler : public GpsHandler
++    {
++    private:
++        char input_host[100] = "127.0.0.1";
++        int input_port = 2947;
++
++        int sock_fd = -1;
++        std::mutex sock_mtx;
++
++        std::atomic<bool> reader_should_run{false};
++        std::thread reader_thread;
++
++        std::mutex fix_mtx;
++        double last_lat = 0, last_lon = 0, last_alt = 0;
++        bool has_fix = false;
++
++        void reader_run();
++        void l_connect(const char *host, int port);
++        void l_disconnect();
++
++    public:
++        GpsdHandler();
++        ~GpsdHandler();
++
++        std::string get_id() override;
++        void set_settings(nlohmann::json settings) override;
++        nlohmann::json get_settings() override;
++        gps_status_t get_fix(double *lat, double *lon, double *alt) override;
++        void render() override;
++        bool is_connected() override;
++        void connect() override;
++        void disconnect() override;
++    };
++}
+diff --git a/src-interface/recorder/tracking/tracking_widget.cpp b/src-interface/recorder/tracking/tracking_widget.cpp
+index af92ea1..9ad3a10 100644
+--- a/src-interface/recorder/tracking/tracking_widget.cpp
++++ b/src-interface/recorder/tracking/tracking_widget.cpp
+@@ -2,6 +2,8 @@
+ #include "common/imgui_utils.h"
+ #include "common/tracking/rotator/rotcl_handler.h"
+ #include "common/tracking/imu/bno055_handler.h"
++#include "common/tracking/gps/gpsd_handler.h"
++#include "common/geodetic/vincentys_calculations.h"
+ #include "core/config.h"
+ #include "core/style.h"
+ #include "imgui/imgui.h"
+@@ -64,6 +66,24 @@ namespace satdump
+ 
+         object_tracker.setImuHandler(imu_handler);
+ 
++        gps_options = gps::getGpsHandlerOptions();
++        for (auto &st : gps_options)
++            gps_options_str += st.name + '\0';
++
++        gps_handler = gps_options[selected_gps_handler].construct();
++
++        if (gps_handler)
++        {
++            try
++            {
++                nlohmann::json cfg = db->get_user_json("recorder_tracking");
++                gps_handler->set_settings(cfg["gps_config"][gps_handler->get_id()]);
++            }
++            catch (std::exception &)
++            {
++            }
++        }
++
+         // Init Obj Tracker
+         object_tracker.setQTH(qth_lon, qth_lat, qth_alt);
+         object_tracker.setRotator(rotator_handler);
+@@ -104,11 +124,71 @@ namespace satdump
+                 auto_scheduler.setEngaged(true, getTime());
+             }
+         }
++
++        // Start GPS polling thread. This only ever pushes a new QTH into object_tracker /
++        // sat_finder / auto_scheduler when gps_live_qth_enabled is set AND the fix has moved
++        // meaningfully -- setQTH() recomputes the SGP4 observer and forces a full pass
++        // recalculation, so it's deliberately throttled rather than called on every fix.
++        gpsth_thread = std::thread(&TrackingWidget::gpsth_run, this);
+     }
+ 
+     TrackingWidget::~TrackingWidget()
+     {
+         saveConfig();
++
++        gpsth_should_run = false;
++        if (gpsth_thread.joinable())
++            gpsth_thread.join();
++    }
++
++    void TrackingWidget::gpsth_run()
++    {
++        double last_pushed_lat = qth_lat, last_pushed_lon = qth_lon, last_pushed_alt = qth_alt;
++        double last_push_time = 0;
++
++        while (gpsth_should_run)
++        {
++            gps_handler_mtx.lock();
++            std::shared_ptr<gps::GpsHandler> handler = gps_handler;
++            gps_handler_mtx.unlock();
++
++            if (gps_live_qth_enabled && handler && handler->is_connected())
++            {
++                double lat, lon, alt_m;
++                if (handler->get_fix(&lat, &lon, &alt_m) == gps::GPS_ERROR_OK)
++                {
++                    double now = getTime();
++                    double alt_km = alt_m / 1000.0;
++
++                    geodetic::geodetic_curve_t curve = geodetic::vincentys_inverse(
++                        geodetic::geodetic_coords_t(last_pushed_lat, last_pushed_lon, last_pushed_alt),
++                        geodetic::geodetic_coords_t(lat, lon, alt_km));
++
++                    bool moved_enough = curve.distance > (gps_min_move_meters / 1000.0); // vincentys distance is in km
++                    bool time_elapsed = (now - last_push_time) > gps_min_update_period_s;
++
++                    if (moved_enough && time_elapsed)
++                    {
++                        qth_lat = lat;
++                        qth_lon = lon;
++                        qth_alt = alt_km;
++
++                        object_tracker.setQTH(qth_lon, qth_lat, qth_alt);
++                        sat_finder.setQTH(qth_lon, qth_lat, qth_alt);
++                        auto_scheduler.setQTH(qth_lon, qth_lat, qth_alt);
++
++                        last_pushed_lat = lat;
++                        last_pushed_lon = lon;
++                        last_pushed_alt = alt_km;
++                        last_push_time = now;
++
++                        logger->info("Live GPS QTH update: %f, %f, %.3fkm", lat, lon, alt_km);
++                    }
++                }
++            }
++
++            std::this_thread::sleep_for(std::chrono::milliseconds(1000)); // 1Hz poll is plenty given the throttling above
++        }
+     }
+ 
+     void TrackingWidget::render()
+@@ -178,6 +258,39 @@ namespace satdump
+             imu_handler->render();
+         }
+ 
++        if (ImGui::CollapsingHeader("GPS / Live QTH Configuration"))
++        {
++            if (gps_handler->is_connected())
++                style::beginDisabled();
++            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
++            if (ImGui::Combo("Type##gpstype", &selected_gps_handler, gps_options_str.c_str()))
++            {
++                gps_handler_mtx.lock();
++                gps_handler = gps_options[selected_gps_handler].construct();
++                gps_handler_mtx.unlock();
++
++                try
++                {
++                    nlohmann::json cfg = db->get_user_json("recorder_tracking");
++                    gps_handler->set_settings(cfg["gps_config"][gps_handler->get_id()]);
++                }
++                catch (std::exception &)
++                {
++                }
++            }
++            if (gps_handler->is_connected())
++                style::endDisabled();
++
++            gps_handler->render();
++
++            ImGui::Spacing();
++            ImGui::Checkbox("Use GPS fix as live QTH", &gps_live_qth_enabled);
++            if (ImGui::IsItemHovered())
++                ImGui::SetTooltip("While enabled, your observer location updates automatically as the GPS fix moves.\nQTH is only pushed when the fix has moved more than a configured threshold, to avoid\nconstantly recomputing satellite passes.");
++
++            ImGui::Text("QTH: %.5f, %.5f, %.3f km", qth_lat, qth_lon, qth_alt);
++        }
++
+         ImGui::Spacing();
+         ImGui::Separator();
+         ImGui::Spacing();
+diff --git a/src-interface/recorder/tracking/tracking_widget.h b/src-interface/recorder/tracking/tracking_widget.h
+index 5a168c6..9cdcea9 100644
+--- a/src-interface/recorder/tracking/tracking_widget.h
++++ b/src-interface/recorder/tracking/tracking_widget.h
+@@ -15,6 +15,7 @@
+ #include "common/tracking/sat_finder/sat_finder_ui.h"
+ #include "common/tracking/scheduler/scheduler.h"
+ #include "common/tracking/imu/imu_handler.h"
++#include "common/tracking/gps/gps_handler.h"
+ #include "import_export.h"
+ 
+ namespace satdump
+@@ -49,6 +50,19 @@ namespace satdump
+         std::string imu_options_str;
+         int selected_imu_handler = 0;
+ 
++        std::shared_ptr<gps::GpsHandler> gps_handler;
++        std::mutex gps_handler_mtx;
++        std::vector<gps::GpsHandlerOption> gps_options;
++        std::string gps_options_str;
++        int selected_gps_handler = 0;
++        bool gps_live_qth_enabled = false; // when true, GPS fixes overwrite qth_lon/lat/alt live
++        double gps_min_move_meters = 50.0; // only push setQTH() when the fix has moved at least this far
++        double gps_min_update_period_s = 5.0; // ...and at most this often
++
++        bool gpsth_should_run = true;
++        std::thread gpsth_thread;
++        void gpsth_run();
++
+         bool config_window_was_asked = false, show_window_config = false;
+         bool satellite_finder_was_asked = false, show_satellite_finder_window = false;
+ 
+@@ -63,6 +77,9 @@ namespace satdump
+                 cfg["rotator_config"][rotator_handler->get_id()] = rotator_handler->get_settings();
+             if (imu_handler)
+                 cfg["imu_config"][imu_handler->get_id()] = imu_handler->get_settings();
++            if (gps_handler)
++                cfg["gps_config"][gps_handler->get_id()] = gps_handler->get_settings();
++            cfg["gps_live_qth_enabled"] = gps_live_qth_enabled;
+ 
+             db->set_user_json("recorder_tracking", cfg);
+         }
+@@ -80,6 +97,7 @@ namespace satdump
+                 auto_scheduler.setTracked(enabled_satellites);
+                 object_tracker.setRotatorConfig(rotator_algo_cfg);
+                 auto_scheduler.setAutoTrackCfg(getValueOrDefault<AutoTrackCfg>(cfg["autotrack_cfg"], AutoTrackCfg()));
++                gps_live_qth_enabled = getValueOrDefault(cfg["gps_live_qth_enabled"], gps_live_qth_enabled);
+             }
+         }
+ 
